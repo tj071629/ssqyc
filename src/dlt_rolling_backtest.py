@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import itertools
 import statistics
 from collections import Counter, defaultdict
@@ -47,7 +48,19 @@ class StrategyState:
     template_back_hit_weight: float = 1.7
     template_back_hit_bonus: float = 0.55
     template_front_hit_bonus: float = 0.25
+    template_front3_hit_bonus: float = 0.0
+    template_joint_3p1_bonus: float = 0.0
     template_reward_baseline: float = 1.1
+
+
+@dataclass(frozen=True)
+class EarlyStopConfig:
+    enabled: bool = False
+    metric: str = "same_ticket_front3_back1"
+    eval_interval: int = 50
+    eval_window: int = 200
+    patience: int = 3
+    min_delta: float = 0.0005
 
 
 FRONT_FEATURE_NAMES = (
@@ -92,6 +105,34 @@ TEMPLATE_NAMES = (
 )
 
 
+def snapshot_state(state: StrategyState) -> dict[str, object]:
+    return {
+        "front_bonus_weights": copy.deepcopy(state.front_bonus_weights),
+        "back_bonus_weights": copy.deepcopy(state.back_bonus_weights),
+        "template_scores": copy.deepcopy(state.template_scores),
+    }
+
+
+def restore_state(state: StrategyState, snapshot: dict[str, object]) -> None:
+    state.front_bonus_weights = copy.deepcopy(snapshot["front_bonus_weights"])
+    state.back_bonus_weights = copy.deepcopy(snapshot["back_bonus_weights"])
+    state.template_scores = copy.deepcopy(snapshot["template_scores"])
+
+
+def metric_value_for_row(metric: str, row: dict[str, object]) -> float:
+    if metric == "same_ticket_front3_back1":
+        return float(any(hit["front_hits"] >= 3 and hit["back_hits"] >= 1 for hit in row["hits"]))
+    if metric == "best_front_2plus":
+        return float(row["best_front_hits"] >= 2)
+    if metric == "best_front_3plus":
+        return float(row["best_front_hits"] >= 3)
+    if metric == "best_back_1plus":
+        return float(row["best_back_hits"] >= 1)
+    if metric == "best_back_exact":
+        return float(row["best_back_hits"] == 2)
+    raise ValueError(f"不支持的早停指标: {metric}")
+
+
 def parse_history(path: Path) -> list[Draw]:
     draws: list[Draw] = []
     for raw_line in path.read_text(encoding="utf-8").splitlines():
@@ -114,14 +155,16 @@ def build_state(
     adaptive: bool,
     *,
     front_learning_rate: float = 0.0,
-    back_learning_rate: float = 0.002,
-    template_learning_rate: float = 0.035,
+    back_learning_rate: float = 0.0015,
+    template_learning_rate: float = 0.03,
     front_weight_decay: float = 1.0,
-    back_weight_decay: float = 0.998,
-    template_decay: float = 0.997,
-    template_back_hit_weight: float = 1.2,
-    template_back_hit_bonus: float = 0.35,
+    back_weight_decay: float = 0.999,
+    template_decay: float = 0.9975,
+    template_back_hit_weight: float = 1.1,
+    template_back_hit_bonus: float = 0.3,
     template_front_hit_bonus: float = 0.25,
+    template_front3_hit_bonus: float = 0.0,
+    template_joint_3p1_bonus: float = 0.0,
     template_reward_baseline: float = 1.1,
 ) -> StrategyState:
     return StrategyState(
@@ -138,6 +181,8 @@ def build_state(
         template_back_hit_weight=template_back_hit_weight,
         template_back_hit_bonus=template_back_hit_bonus,
         template_front_hit_bonus=template_front_hit_bonus,
+        template_front3_hit_bonus=template_front3_hit_bonus,
+        template_joint_3p1_bonus=template_joint_3p1_bonus,
         template_reward_baseline=template_reward_baseline,
     )
 
@@ -606,6 +651,34 @@ def build_back_pair_pool(
     return select_back_pairs(candidate_pairs, back_ranked, state_info, last_back, hot_back, warm_back, back_neighbors, count=5)
 
 
+def build_back_pair_routes(
+    back_ranked: list[int],
+    state_info: dict[str, object],
+    last_back: tuple[int, ...],
+    hot_back: list[int],
+    warm_back: list[int],
+    back_neighbors: list[int],
+) -> list[tuple[int, ...]]:
+    """Return diversified 5-pair routes for 5 tickets.
+
+    Route design: active continuation / neighbor carry / warm-replenish / reverse jump / balanced fallback.
+    """
+    routes: list[tuple[int, ...]] = []
+    routes.append(choose_back_numbers(back_ranked, include=list(last_back[:1]) + back_neighbors[:1]))
+    routes.append(choose_back_numbers(back_ranked, include=back_neighbors[:2]))
+    routes.append(choose_back_numbers(back_ranked, include=warm_back[:1] + hot_back[:1]))
+    routes.append(choose_back_numbers(back_ranked, include=warm_back[:1], reverse_jump=True, reverse_start_rank=4))
+    routes.append(choose_back_numbers(back_ranked, include=hot_back[:1] + list(last_back[:1])))
+
+    pool = build_back_pair_pool(back_ranked, state_info, last_back, hot_back, warm_back, back_neighbors)
+    for pair in pool:
+        if len(routes) >= 5:
+            break
+        routes.append(pair)
+
+    return unique_pairs(routes)[:5]
+
+
 def front_overlap(left: tuple[int, ...], right: tuple[int, ...]) -> int:
     return len(set(left) & set(right))
 
@@ -969,12 +1042,26 @@ def generate_tickets(window: list[Draw], state: StrategyState, count: int = DEFA
     }
 
     selected_names = choose_template_names(state_info, state, count)
+    if count == 5:
+        # Force 5-ticket portfolio: 2 mainline + 2 divergence + 1 reverse-cold.
+        if state_info["front_state"] == "extreme":
+            selected_names = ["主承接票", "断区反抽票", "结构平衡票", "后区回补票", "逆向跳号票"]
+        elif state_info["front_state"] == "rebound":
+            selected_names = ["主承接票", "结构平衡票", "骨架回补票", "后区活跃票", "逆向跳号票"]
+        elif state_info["front_state"] == "mid-heavy":
+            selected_names = ["主承接票", "中区加压票", "结构平衡票", "后区回补票", "逆向跳号票"]
+        else:
+            selected_names = ["主承接票", "结构平衡票", "骨架回补票", "后区活跃票", "逆向跳号票"]
+
     back_pair_pool = build_back_pair_pool(back_ranked, state_info, last.back, hot_back, warm_back, back_neighbors)
+    back_pair_routes = build_back_pair_routes(back_ranked, state_info, last.back, hot_back, warm_back, back_neighbors)
     pair_index = 0
     tickets: list[Ticket] = []
     for name in selected_names[:count]:
         template = template_map[name]
-        if name == "后区活跃票" and state_info["back_state"] == "active":
+        if count == 5 and len(back_pair_routes) >= 5:
+            back_pair = back_pair_routes[len(tickets)]
+        elif name == "后区活跃票" and state_info["back_state"] == "active":
             back_pair = back_pair_pool[0]
         elif name == "后区回补票" and state_info["back_state"] == "replenish":
             back_pair = back_pair_pool[0]
@@ -1049,6 +1136,8 @@ def update_template_scores(state: StrategyState, tickets: list[Ticket], hits: li
         reward = hit["front_hits"] + hit["back_hits"] * state.template_back_hit_weight
         bonus = state.template_front_hit_bonus if hit["front_hits"] >= 2 else 0.0
         bonus += state.template_back_hit_bonus if hit["back_hits"] >= 1 else 0.0
+        bonus += state.template_front3_hit_bonus if hit["front_hits"] >= 3 else 0.0
+        bonus += state.template_joint_3p1_bonus if hit["front_hits"] >= 3 and hit["back_hits"] >= 1 else 0.0
         delta = state.template_learning_rate * (reward + bonus - state.template_reward_baseline)
         state.template_scores[ticket.name] = max(0.35, min(3.5, state.template_scores[ticket.name] + delta))
 
@@ -1068,12 +1157,20 @@ def rolling_backtest(
     *,
     adaptive: bool,
     adaptive_config: dict[str, float] | None = None,
+    early_stop_config: EarlyStopConfig | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     results: list[dict[str, object]] = []
     aggregate = defaultdict(int)
     aggregate_lists: dict[str, list[float]] = defaultdict(list)
     state_aggregate: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     state = build_state(adaptive=adaptive, **(adaptive_config or {}))
+    early_stop = early_stop_config or EarlyStopConfig()
+    learning_active = adaptive
+    best_state_snapshot = snapshot_state(state)
+    best_eval_score = float("-inf")
+    stale_evals = 0
+    early_stop_triggered = False
+    early_stop_trigger_window = None
 
     for start in range(0, len(draws) - window_size):
         window = draws[start : start + window_size]
@@ -1097,6 +1194,9 @@ def rolling_backtest(
         aggregate["best_front_3plus"] += int(best["front_hits"] >= 3)
         aggregate["best_back_1plus"] += int(best["back_hits"] >= 1)
         aggregate["best_back_exact"] += int(best["back_hits"] == 2)
+        aggregate["same_ticket_front3_back1"] += int(
+            any(hit["front_hits"] >= 3 and hit["back_hits"] >= 1 for hit in hits)
+        )
         aggregate["extreme_zone_windows"] += extreme_zone
         aggregate["high_stack_windows"] += high_stack
 
@@ -1136,7 +1236,7 @@ def rolling_backtest(
             }
         )
 
-        if adaptive:
+        if learning_active:
             update_bonus_weights(
                 state.front_bonus_weights,
                 front_feature_table,
@@ -1157,6 +1257,23 @@ def rolling_backtest(
             )
             update_template_scores(state, tickets, hits)
 
+        if adaptive and early_stop.enabled:
+            window_count = aggregate["windows"]
+            if window_count % max(1, early_stop.eval_interval) == 0 and len(results) >= max(1, early_stop.eval_window):
+                recent_rows = results[-early_stop.eval_window :]
+                eval_score = statistics.mean(metric_value_for_row(early_stop.metric, row) for row in recent_rows)
+                if eval_score > best_eval_score + early_stop.min_delta:
+                    best_eval_score = eval_score
+                    stale_evals = 0
+                    best_state_snapshot = snapshot_state(state)
+                else:
+                    stale_evals += 1
+                    if stale_evals >= early_stop.patience and learning_active:
+                        restore_state(state, best_state_snapshot)
+                        learning_active = False
+                        early_stop_triggered = True
+                        early_stop_trigger_window = window_count
+
     summary = {
         "adaptive": adaptive,
         "windows": aggregate["windows"],
@@ -1167,6 +1284,7 @@ def rolling_backtest(
         "best_front_3plus_rate": aggregate["best_front_3plus"] / aggregate["windows"],
         "best_back_1plus_rate": aggregate["best_back_1plus"] / aggregate["windows"],
         "best_back_exact_rate": aggregate["best_back_exact"] / aggregate["windows"],
+        "same_ticket_front3_back1_rate": aggregate["same_ticket_front3_back1"] / aggregate["windows"],
         "extreme_zone_rate": aggregate["extreme_zone_windows"] / aggregate["windows"],
         "high_stack_rate": aggregate["high_stack_windows"] / aggregate["windows"],
         "avg_best_front_hits": statistics.mean(aggregate_lists["best_front_hits"]),
@@ -1179,6 +1297,17 @@ def rolling_backtest(
         "top_back_weights": top_weight_items(state.back_bonus_weights),
         "bottom_back_weights": bottom_weight_items(state.back_bonus_weights),
         "top_templates": sorted(state.template_scores.items(), key=lambda item: (-item[1], item[0]))[:5],
+        "early_stop": {
+            "enabled": early_stop.enabled,
+            "metric": early_stop.metric,
+            "eval_interval": early_stop.eval_interval,
+            "eval_window": early_stop.eval_window,
+            "patience": early_stop.patience,
+            "min_delta": early_stop.min_delta,
+            "triggered": early_stop_triggered,
+            "trigger_window": early_stop_trigger_window,
+            "best_eval_score": (best_eval_score if best_eval_score != float("-inf") else None),
+        },
         "state_breakdown": {
             key: {
                 "windows": values["windows"],
@@ -1197,6 +1326,7 @@ def compare_summaries(fixed: dict[str, object], adaptive: dict[str, object]) -> 
         "best_front_3plus_delta": adaptive["best_front_3plus_rate"] - fixed["best_front_3plus_rate"],
         "best_back_1plus_delta": adaptive["best_back_1plus_rate"] - fixed["best_back_1plus_rate"],
         "best_back_exact_delta": adaptive["best_back_exact_rate"] - fixed["best_back_exact_rate"],
+        "same_ticket_front3_back1_delta": adaptive["same_ticket_front3_back1_rate"] - fixed["same_ticket_front3_back1_rate"],
         "avg_best_front_hits_delta": adaptive["avg_best_front_hits"] - fixed["avg_best_front_hits"],
         "avg_best_back_hits_delta": adaptive["avg_best_back_hits"] - fixed["avg_best_back_hits"],
     }
@@ -1227,6 +1357,7 @@ def build_report(
     lines.append(f"| 5注至少1注命中前区3码及以上 | `{fixed_summary['best_front_3plus_rate']:.2%}` | `{adaptive_summary['best_front_3plus_rate']:.2%}` | `{comparison['best_front_3plus_delta']:+.2%}` |")
     lines.append(f"| 5注至少1注命中后区1码 | `{fixed_summary['best_back_1plus_rate']:.2%}` | `{adaptive_summary['best_back_1plus_rate']:.2%}` | `{comparison['best_back_1plus_delta']:+.2%}` |")
     lines.append(f"| 5注后区2码全中 | `{fixed_summary['best_back_exact_rate']:.2%}` | `{adaptive_summary['best_back_exact_rate']:.2%}` | `{comparison['best_back_exact_delta']:+.2%}` |")
+    lines.append(f"| 同一注同时命中前区3码+后区1码 | `{fixed_summary['same_ticket_front3_back1_rate']:.2%}` | `{adaptive_summary['same_ticket_front3_back1_rate']:.2%}` | `{comparison['same_ticket_front3_back1_delta']:+.2%}` |")
     lines.append(f"| 最优单注平均前区命中 | `{fixed_summary['avg_best_front_hits']:.2f}` | `{adaptive_summary['avg_best_front_hits']:.2f}` | `{comparison['avg_best_front_hits_delta']:+.2f}` |")
     lines.append(f"| 最优单注平均后区命中 | `{fixed_summary['avg_best_back_hits']:.2f}` | `{adaptive_summary['avg_best_back_hits']:.2f}` | `{comparison['avg_best_back_hits_delta']:+.2f}` |")
     lines.append("")
@@ -1299,7 +1430,7 @@ def build_rule_summary(fixed_summary: dict[str, object], adaptive_summary: dict[
         [
             "## 3.1 基于50期滚动回测的逐期在线修订",
             "- 新增一套严格在线回测流程：任取最近 `50` 期作为训练集，生成 `5` 注候选票，只与下一期对比；复盘后立即更新规则参数，再用更新后的规则去预测后一期。",
-            f"- 当前全量历史样本共滚动 `2810` 次；固定规则下，5注至少命中前区 `2` 码的比例为 `{fixed_summary['best_front_2plus_rate']:.2%}`，逐期自适应后为 `{adaptive_summary['best_front_2plus_rate']:.2%}`，变化 `{comparison['best_front_2plus_delta']:+.2%}`。",
+            f"- 当前全量历史样本共滚动 `{adaptive_summary['windows']}` 次；固定规则下，5注至少命中前区 `2` 码的比例为 `{fixed_summary['best_front_2plus_rate']:.2%}`，逐期自适应后为 `{adaptive_summary['best_front_2plus_rate']:.2%}`，变化 `{comparison['best_front_2plus_delta']:+.2%}`。",
             f"- 固定规则下，5注至少命中后区 `1` 码的比例为 `{fixed_summary['best_back_1plus_rate']:.2%}`，逐期自适应后为 `{adaptive_summary['best_back_1plus_rate']:.2%}`，变化 `{comparison['best_back_1plus_delta']:+.2%}`。",
             front_rule_line,
             f"- 自适应最终增强的后区特征主要是：`{', '.join(name for name, _ in adaptive_summary['top_back_weights'])}`；说明后区应继续围绕活跃、邻接与遗漏步进信号构建。",
@@ -1340,6 +1471,17 @@ def main() -> None:
         action="store_true",
         help="打印适合写入规则文档的摘要",
     )
+    parser.add_argument("--early-stop", action="store_true", help="启用自动早停学习器")
+    parser.add_argument(
+        "--early-stop-metric",
+        default="same_ticket_front3_back1",
+        choices=["same_ticket_front3_back1", "best_front_2plus", "best_front_3plus", "best_back_1plus", "best_back_exact"],
+        help="早停监控指标",
+    )
+    parser.add_argument("--early-stop-eval-interval", type=int, default=50, help="每隔多少滚动窗口评估一次早停")
+    parser.add_argument("--early-stop-eval-window", type=int, default=200, help="每次评估使用最近多少窗口")
+    parser.add_argument("--early-stop-patience", type=int, default=3, help="连续多少次无提升后触发早停")
+    parser.add_argument("--early-stop-min-delta", type=float, default=0.0005, help="视为提升的最小阈值")
     args = parser.parse_args()
 
     draws = parse_history(Path(args.history))
@@ -1347,7 +1489,20 @@ def main() -> None:
         raise SystemExit("历史数据不足，无法完成滚动回测。")
 
     fixed_results, fixed_summary = rolling_backtest(draws, args.window_size, args.ticket_count, adaptive=False)
-    adaptive_results, adaptive_summary = rolling_backtest(draws, args.window_size, args.ticket_count, adaptive=True)
+    adaptive_results, adaptive_summary = rolling_backtest(
+        draws,
+        args.window_size,
+        args.ticket_count,
+        adaptive=True,
+        early_stop_config=EarlyStopConfig(
+            enabled=args.early_stop,
+            metric=args.early_stop_metric,
+            eval_interval=args.early_stop_eval_interval,
+            eval_window=args.early_stop_eval_window,
+            patience=args.early_stop_patience,
+            min_delta=args.early_stop_min_delta,
+        ),
+    )
     comparison = compare_summaries(fixed_summary, adaptive_summary)
     report = build_report(
         fixed_results,
@@ -1368,6 +1523,14 @@ def main() -> None:
     print(f"自适应规则 前区2码命中率：{adaptive_summary['best_front_2plus_rate']:.2%}")
     print(f"固定规则 后区1码命中率：{fixed_summary['best_back_1plus_rate']:.2%}")
     print(f"自适应规则 后区1码命中率：{adaptive_summary['best_back_1plus_rate']:.2%}")
+    if args.early_stop:
+        early_stop_info = adaptive_summary["early_stop"]
+        print(
+            "早停状态："
+            f"触发={early_stop_info['triggered']}，"
+            f"触发窗口={early_stop_info['trigger_window']}，"
+            f"最佳评估分={early_stop_info['best_eval_score']}"
+        )
     if args.print_rule_summary:
         print("")
         print(build_rule_summary(fixed_summary, adaptive_summary, comparison))
