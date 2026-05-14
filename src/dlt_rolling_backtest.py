@@ -510,14 +510,22 @@ def choose_template_names(state_info: dict[str, object], state: StrategyState, c
         priority = sorted(priority, key=lambda name: (-state.template_scores[name], TEMPLATE_NAMES.index(name)))
 
     seen = set()
-    final_names: list[str] = []
+    base_order: list[str] = []
     for name in selected + priority:
         if name in seen:
             continue
         seen.add(name)
-        final_names.append(name)
-        if len(final_names) >= count:
-            break
+        base_order.append(name)
+
+    if not base_order:
+        return ["结构平衡票"] * count
+    if count <= len(base_order):
+        return base_order[:count]
+    final_names = list(base_order)
+    idx = 0
+    while len(final_names) < count:
+        final_names.append(base_order[idx % len(base_order)])
+        idx += 1
     return final_names
 
 
@@ -940,6 +948,87 @@ def distinct_ticket(candidate: Ticket, existing: list[Ticket], window: list[Draw
         if not exact_front_seen(window, mutated_tuple) and all(ticket.front != mutated_tuple for ticket in existing):
             return Ticket(candidate.name, mutated_tuple, candidate.back, candidate.note + "（去重修正）")
     return candidate
+
+
+def reduce_front_overlap(
+    front: tuple[int, ...],
+    existing_fronts: list[tuple[int, ...]],
+    ranked: list[int],
+    *,
+    max_overlap: int,
+) -> tuple[int, ...]:
+    selected = list(front)
+    for existing in existing_fronts:
+        existing_set = set(existing)
+        while len(set(selected) & existing_set) > max_overlap:
+            outgoing = next((number for number in reversed(selected) if number in existing_set), None)
+            if outgoing is None:
+                break
+            incoming = next((number for number in ranked if number not in selected and number not in existing_set), None)
+            if incoming is None:
+                incoming = next((number for number in ranked if number not in selected), None)
+            if incoming is None:
+                break
+            selected.remove(outgoing)
+            selected.append(incoming)
+            selected.sort()
+    return tuple(sorted(selected))
+
+
+def apply_front_diversity_for_large_set(
+    tickets: list[Ticket],
+    ranked: list[int],
+    *,
+    max_overlap: int = 3,
+) -> list[Ticket]:
+    if len(tickets) < 6:
+        return tickets
+    diversified: list[Ticket] = []
+    existing_fronts: list[tuple[int, ...]] = []
+    for ticket in tickets:
+        adjusted_front = reduce_front_overlap(ticket.front, existing_fronts, ranked, max_overlap=max_overlap)
+        note = ticket.note
+        if adjusted_front != ticket.front:
+            note = f"{note}；去同质化"
+        diversified.append(Ticket(ticket.name, adjusted_front, ticket.back, note))
+        existing_fronts.append(adjusted_front)
+    return diversified
+
+
+def choose_template_names_for_ten(state_info: dict[str, object], state: StrategyState) -> list[str]:
+    front_state = state_info["front_state"]
+    if front_state == "extreme":
+        mainline = ["主承接票", "极端延续票", "结构平衡票", "骨架回补票", "重号集中票"]
+    elif front_state == "mid-heavy":
+        mainline = ["中区加压票", "主承接票", "结构平衡票", "骨架回补票", "重号集中票"]
+    elif front_state == "rebound":
+        mainline = ["主承接票", "回稳反抽票", "结构平衡票", "骨架回补票", "重号集中票"]
+    else:
+        mainline = ["主承接票", "结构平衡票", "骨架回补票", "重号集中票", "中区加压票"]
+
+    switching = ["后区活跃票", "后区回补票", "回稳反抽票"]
+    break_branch = ["断区反抽票"]
+    reverse = ["逆向跳号票"]
+    plan = mainline + switching + break_branch + reverse
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in plan:
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+
+    if len(ordered) < 10:
+        fallback = sorted(TEMPLATE_NAMES, key=lambda name: (-state.template_scores[name], TEMPLATE_NAMES.index(name)))
+        for name in fallback:
+            if name in seen:
+                continue
+            seen.add(name)
+            ordered.append(name)
+            if len(ordered) >= 10:
+                break
+    return ordered[:10]
 
 
 def generate_tickets(window: list[Draw], state: StrategyState, count: int = DEFAULT_TICKET_COUNT) -> tuple[list[Ticket], list[int], list[int], dict[int, dict[str, float]], dict[int, dict[str, float]]]:

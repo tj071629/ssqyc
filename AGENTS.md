@@ -140,6 +140,7 @@ with open('docs/双色球历史开奖号码.md', 'r', encoding='utf-8') as f:
 3. 生成多个候选集并排序，而非只输出单一结果
 4. 硬性约束作为**最终验证步骤**，不是前置过滤
 5. 包含**赛后复盘功能**追踪预测准确度
+6. **大乐透模型默认口径**：凡基于 `src/dlt_rolling_backtest.py` 的打分、选池、注单生成与滚动回测，一律以 **逐期学习后的权重**（每期开奖后按 `rolling_backtest(..., adaptive=True)` 同源逻辑更新 `StrategyState`）为准；仅在需要「固定规则对照」时再并列给出 `adaptive=False`。
 
 ## 复盘检查项
 
