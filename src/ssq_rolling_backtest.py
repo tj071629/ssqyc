@@ -6,13 +6,15 @@ import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 
 RED_RANGE = range(1, 34)
 BLUE_RANGE = range(1, 17)
 WINDOW_SIZE = 50
 DEFAULT_TICKET_COUNT = 5
+# Portfolio filter: max overlap of 6 reds with any prior draw must be exactly this count.
+EXACT_FULL_HISTORY_RED_OVERLAP = 4
 
 # Full-history stability search defaults (3394 rolling windows).
 FULL_HISTORY_RED_NORMAL = {"hot10": 0.0, "hot20": 0.01, "repeat_last": 0.0, "neighbor_last": 0.0, "omission_mid": 0.04}
@@ -21,6 +23,8 @@ FULL_HISTORY_RED_EXTREME = {"hot20": 0.04, "omission_mid": 0.08, "zone_cold": 0.
 # Last-300-draw stability fine-tune (--recent-draws 300 --grid-search-stability).
 RECENT_300_RED_NORMAL = {"hot10": 0.0, "hot20": 0.01, "repeat_last": 0.0, "neighbor_last": 0.0, "omission_mid": 0.03}
 RECENT_300_RED_EXTREME = {"hot20": 0.04, "omission_mid": 0.08, "zone_cold": 0.04, "hot50": 0.02}
+# Blue: `blue_base_score` + weighted_bonus(blue_weights, blue_features). Tuned 2026-05-11 via --grid-search-blue-near300
+# (KPI: any_blue_hit on last-300 tail; picked minimal non-zero set that beats baseline without hurting red3+).
 
 
 @dataclass(frozen=True)
@@ -115,12 +119,25 @@ def parse_history(path: Path) -> list[Draw]:
     return draws
 
 
+RECENT_300_BLUE_WEIGHTS: dict[str, float] = {
+    "hot5": 0.0,
+    "hot10": 0.0,
+    "repeat_last": 0.0,
+    "neighbor_last": 0.0,
+    "neighbor_prev": 0.0,
+    "omission_step": 0.0,
+    "omission_mid": 0.08,
+    "omission_deep": 0.0,
+}
+
+
 def build_state(
     adaptive: bool,
     overrides: dict[str, float] | None = None,
     extreme_overrides: dict[str, float] | None = None,
     *,
     preset: str = "full",
+    blue_weight_overrides: dict[str, float] | None = None,
 ) -> StrategyState:
     # Weak-adaptation defaults for SSQ:
     # keep online correction conservative to avoid degrading baseline hit rates.
@@ -153,6 +170,13 @@ def build_state(
         for name, value in extreme_overrides.items():
             if name in state.red_weights_extreme:
                 state.red_weights_extreme[name] = value
+    if preset == "recent300":
+        for name in BLUE_FEATURES:
+            state.blue_weights[name] = RECENT_300_BLUE_WEIGHTS.get(name, 0.0)
+    if blue_weight_overrides:
+        for name, value in blue_weight_overrides.items():
+            if name in state.blue_weights:
+                state.blue_weights[name] = value
     return state
 
 
@@ -177,6 +201,27 @@ def red_zone_signature(red: tuple[int, ...]) -> tuple[int, int, int]:
     for number in red:
         counts[red_zone_index(number)] += 1
     return tuple(counts)
+
+
+def is_zone1_break_last(window: list[Draw]) -> bool:
+    """True when the training window ends on a draw with zero reds in zone1 (01-11)."""
+    return red_zone_signature(window[-1].red)[0] == 0
+
+
+def zone1_break_follow_red_counts(draws: list[Draw]) -> dict[int, int]:
+    """For each draw with no zone1 reds, count reds in the immediately following draw (full `draws` timeline)."""
+    counts: Counter[int] = Counter()
+    for i in range(len(draws) - 1):
+        if red_zone_signature(draws[i].red)[0] != 0:
+            continue
+        for number in draws[i + 1].red:
+            counts[number] += 1
+    return dict(counts)
+
+
+def refine_red_ranked_zone1_follow_ties(scores: dict[int, float], follow_counts: dict[int, int]) -> list[int]:
+    """Same as baseline red order, but when model scores tie, prefer reds that historically hit more often right after a zone1 break."""
+    return sorted(RED_RANGE, key=lambda n: (-scores[n], -follow_counts.get(n, 0), n))
 
 
 def is_extreme_window(window: list[Draw]) -> bool:
@@ -309,11 +354,75 @@ def blue_base_score(number: int, context: dict[str, object]) -> float:
     if 3 <= miss <= 7:
         score += 0.7
     if miss >= 10:
-        score -= 0.2
+        # Tail blues (13-16) deep-cold hits (e.g. 2026055 blue 13) were over-penalized vs small-band hot bias.
+        score -= 0.05 if number >= 13 else 0.2
     return score
 
 
-def score_red(window: list[Draw], state: StrategyState) -> tuple[list[int], dict[int, dict[str, float]]]:
+def is_small_blue_band_hot(window: list[Draw]) -> bool:
+    """True when recent draws cluster in 01-11 (blue-ball专规 v0.5 §2.12)."""
+    return sum(1 for draw in window[-10:] if draw.blue <= 11) >= 6
+
+
+def pick_blue_pool_five(window: list[Draw], blue_ranked: list[int]) -> list[int]:
+    """Up to 5 distinct blues: repeat/neighbor, optional mid 08-12, model top, optional tail 13-16."""
+    last = window[-1]
+    prev = window[-2]
+    rank_index = {number: idx for idx, number in enumerate(blue_ranked)}
+    blues: list[int] = []
+
+    def add(number: int) -> None:
+        if number in BLUE_RANGE and number not in blues:
+            blues.append(number)
+
+    add(choose_blue(blue_ranked, include=[last.blue]))
+    for neighbor in (last.blue - 1, last.blue + 1, prev.blue - 1, prev.blue + 1):
+        if neighbor in BLUE_RANGE:
+            add(choose_blue(blue_ranked, include=[neighbor]))
+
+    if is_small_blue_band_hot(window):
+        for number in sorted(range(8, 13), key=lambda b: (rank_index.get(b, 99), -omission(window, "blue", b), b)):
+            add(number)
+            if len(blues) >= 3:
+                break
+
+    for number in blue_ranked:
+        add(number)
+        if len(blues) >= 5:
+            break
+
+    if is_small_blue_band_hot(window):
+        for number in sorted(range(13, 17), key=lambda b: (-omission(window, "blue", b), rank_index.get(b, 99), b)):
+            if number in blues:
+                continue
+            if len(blues) >= 5:
+                blues[-1] = number
+            else:
+                blues.append(number)
+            break
+
+    return blues[:5]
+
+
+def apply_diverse_blues(tickets: list[Ticket], window: list[Draw], blue_ranked: list[int]) -> list[Ticket]:
+    """Assign five distinct blues from `pick_blue_pool_five` to improve any-blue hit rate."""
+    pool = pick_blue_pool_five(window, blue_ranked)
+    used: list[int] = []
+    diversified: list[Ticket] = []
+    for ticket in tickets:
+        blue: int | None = None
+        for candidate in pool + [number for number in blue_ranked if number not in pool]:
+            if candidate not in used:
+                blue = candidate
+                break
+        blue = blue if blue is not None else pool[0]
+        used.append(blue)
+        note = ticket.note if ticket.blue == blue else f"{ticket.note}·蓝分散"
+        diversified.append(Ticket(ticket.name, ticket.red, blue, note))
+    return diversified
+
+
+def score_red(window: list[Draw], state: StrategyState) -> tuple[list[int], dict[int, dict[str, float]], dict[int, float]]:
     context = build_red_context(window)
     red_weights = state.red_weights_extreme if is_extreme_window(window) else state.red_weights
     scores: dict[int, float] = {}
@@ -323,7 +432,7 @@ def score_red(window: list[Draw], state: StrategyState) -> tuple[list[int], dict
         feature_table[number] = features
         scores[number] = red_base_score(number, context) + weighted_bonus(red_weights, features)
     ranked = sorted(scores, key=lambda n: (-scores[n], n))
-    return ranked, feature_table
+    return ranked, feature_table, scores
 
 
 def score_blue(window: list[Draw], state: StrategyState) -> tuple[list[int], dict[int, dict[str, float]]]:
@@ -383,6 +492,69 @@ def choose_red(
     return tuple(sorted(selected[:6]))
 
 
+def choose_red_by_zone_targets(
+    ranked: list[int],
+    z1_need: int,
+    z2_need: int,
+    z3_need: int,
+    *,
+    include: Iterable[int] = (),
+    exclude: Iterable[int] = (),
+    zone_skips: tuple[int, int, int] | None = None,
+) -> tuple[int, ...]:
+    """Pick 6 reds with exact zone counts (low / mid / high). Fills from `ranked` per zone; relaxes skips if a zone runs dry."""
+    assert z1_need + z2_need + z3_need == 6
+    zone_skips = zone_skips or (0, 0, 0)
+    excluded = set(exclude)
+    picked: list[int] = []
+    needs = [z1_need, z2_need, z3_need]
+    counts = [0, 0, 0]
+
+    for number in sorted(set(include)):
+        if number in excluded or number in picked:
+            continue
+        zone = red_zone_index(number)
+        if counts[zone] < needs[zone]:
+            picked.append(number)
+            counts[zone] += 1
+
+    for zone in range(3):
+        skip_remaining = zone_skips[zone]
+        for number in ranked:
+            if counts[zone] >= needs[zone]:
+                break
+            if number in excluded or number in picked:
+                continue
+            if red_zone_index(number) != zone:
+                continue
+            if skip_remaining > 0:
+                skip_remaining -= 1
+                continue
+            picked.append(number)
+            counts[zone] += 1
+
+    for zone in range(3):
+        for number in ranked:
+            if counts[zone] >= needs[zone]:
+                break
+            if number in excluded or number in picked:
+                continue
+            if red_zone_index(number) != zone:
+                continue
+            picked.append(number)
+            counts[zone] += 1
+
+    if len(picked) < 6:
+        for number in ranked:
+            if number in picked or number in excluded:
+                continue
+            picked.append(number)
+            if len(picked) == 6:
+                break
+
+    return tuple(sorted(picked[:6]))
+
+
 def choose_blue(ranked: list[int], *, include: Iterable[int] = (), reverse_jump: bool = False, reverse_from: int = 5) -> int:
     include_list = [number for number in include if number in BLUE_RANGE]
     if include_list:
@@ -408,6 +580,31 @@ def distinct_red(candidate: tuple[int, ...], existing: list[Ticket], ranked: lis
         if alt_tuple not in existing_reds:
             return alt_tuple
     return candidate
+
+
+def distinct_red_preserve_zone_signature(
+    candidate: tuple[int, ...],
+    existing: list[Ticket],
+    ranked: list[int],
+    required_sig: tuple[int, int, int],
+) -> tuple[int, ...]:
+    """Like distinct_red but only swaps within the same zone so (z1,z2,z3) stays valid for 断一区后 structured tickets."""
+    existing_reds = {ticket.red for ticket in existing}
+    if candidate not in existing_reds:
+        return candidate
+    if red_zone_signature(candidate) != required_sig:
+        return distinct_red(candidate, existing, ranked)
+    base = sorted(candidate)
+    for idx in range(6):
+        zone = red_zone_index(base[idx])
+        for number in ranked:
+            if number in base or red_zone_index(number) != zone:
+                continue
+            alt = sorted(base[:idx] + [number] + base[idx + 1 :])
+            alt_tuple = tuple(alt)
+            if alt_tuple not in existing_reds and red_zone_signature(alt_tuple) == required_sig:
+                return alt_tuple
+    return distinct_red(candidate, existing, ranked)
 
 
 def build_red_priority_portfolio(red_ranked: list[int], blue_ranked: list[int], window: list[Draw]) -> list[Ticket]:
@@ -439,8 +636,212 @@ def build_red_priority_portfolio(red_ranked: list[int], blue_ranked: list[int], 
     return tickets
 
 
-def generate_tickets(window: list[Draw], state: StrategyState, ticket_count: int) -> tuple[list[Ticket], list[int], list[int], dict[int, dict[str, float]], dict[int, dict[str, float]]]:
-    red_ranked, red_features_table = score_red(window, state)
+def _zone1_break_neighbor_order(last: Draw) -> list[int]:
+    neighbors_last = sorted({n for value in last.red for n in (value - 1, value + 1) if n in RED_RANGE})
+    low_first = [n for n in neighbors_last if red_zone_index(n) == 0]
+    mid = [n for n in neighbors_last if red_zone_index(n) == 1]
+    high = [n for n in neighbors_last if red_zone_index(n) == 2]
+    return low_first + mid + high
+
+
+def build_portfolio_after_zone1_break(red_ranked: list[int], blue_ranked: list[int], window: list[Draw]) -> list[Ticket]:
+    """After a zone1 break (last window draw has no 01-11), bias next-ticket reds toward historical follow-ups.
+
+    Empirical skew (from project stats): zone2 often ~2; 2:2:2 / 3:2:1 / 2:3:1 common; zone3 usually >=1 (often >=2).
+    """
+    last = window[-1]
+    prev = window[-2]
+    neighbor_pref = _zone1_break_neighbor_order(last)
+    blue_neighbors = [n for n in (last.blue - 1, last.blue + 1, prev.blue - 1, prev.blue + 1) if n in BLUE_RANGE]
+
+    t1_red = choose_red_by_zone_targets(red_ranked, 2, 2, 2, include=neighbor_pref[:4])
+    t2_red = choose_red_by_zone_targets(red_ranked, 2, 2, 2, include=neighbor_pref[2:6], zone_skips=(1, 0, 1))
+    t3_red = choose_red_by_zone_targets(red_ranked, 2, 3, 1, include=neighbor_pref[:3])
+    t4_red = choose_red_by_zone_targets(red_ranked, 3, 2, 1, include=neighbor_pref[:4])
+    t5_red = choose_red_by_zone_targets(red_ranked, 1, 2, 3, include=neighbor_pref[:2])
+
+    return [
+        Ticket("主线票", t1_red, choose_blue(blue_ranked, include=[last.blue]), "断一区后·均衡2:2:2+邻号低区回补"),
+        Ticket("重号票", t2_red, choose_blue(blue_ranked, include=blue_neighbors[:1]), "断一区后·均衡2:2:2变序"),
+        Ticket("邻号票", t3_red, choose_blue(blue_ranked), "断一区后·二区偏重2:3:1"),
+        Ticket("均衡票", t4_red, choose_blue(blue_ranked, include=blue_neighbors[1:2]), "断一区后·低区回补3:2:1"),
+        Ticket("跳点票", t5_red, choose_blue(blue_ranked, reverse_jump=True, reverse_from=6), "断一区后·高区加重1:2:3"),
+    ]
+
+
+def build_zone1_break_supplement_tickets(
+    red_ranked: list[int],
+    blue_ranked: list[int],
+    window: list[Draw],
+    existing: list[Ticket],
+    *,
+    count: int = 4,
+) -> list[Ticket]:
+    """Optional extra tickets after the 5-note zone1-follow portfolio (not used in rolling backtest by default)."""
+    last = window[-1]
+    prev = window[-2]
+    neighbor_pref = _zone1_break_neighbor_order(last)
+    blue_neighbors = [n for n in (last.blue - 1, last.blue + 1, prev.blue - 1, prev.blue + 1) if n in BLUE_RANGE]
+    cold_jump = [number for number in red_ranked[10:24] if number not in last.red]
+
+    blue_nb0 = choose_blue(blue_ranked, include=blue_neighbors[:1])
+    blue_nb1 = choose_blue(blue_ranked, include=blue_neighbors[1:2]) if len(blue_neighbors) > 1 else choose_blue(blue_ranked)
+
+    specs: list[tuple[str, tuple[int, ...], int, str, bool]] = [
+        (
+            "加推1",
+            choose_red(red_ranked, include=cold_jump[:2]),
+            choose_blue(blue_ranked, reverse_jump=True, reverse_from=6),
+            "断一区后·加推冷补线",
+            False,
+        ),
+        (
+            "加推2",
+            choose_red_by_zone_targets(red_ranked, 1, 3, 2, include=neighbor_pref[:3]),
+            blue_nb0,
+            "断一区后·加推1:3:2",
+            True,
+        ),
+        (
+            "加推3",
+            choose_red_by_zone_targets(red_ranked, 4, 1, 1, include=neighbor_pref[:4]),
+            choose_blue(blue_ranked),
+            "断一区后·加推4:1:1",
+            True,
+        ),
+        (
+            "加推4",
+            choose_red_by_zone_targets(red_ranked, 3, 1, 2, include=neighbor_pref[:4]),
+            blue_nb1,
+            "断一区后·加推3:1:2",
+            True,
+        ),
+    ]
+
+    ex = list(existing)
+    out: list[Ticket] = []
+    for name, red, blue, note, fixed_sig in specs[: max(0, min(count, len(specs)))]:
+        if fixed_sig:
+            sig = red_zone_signature(red)
+            red2 = distinct_red_preserve_zone_signature(red, ex, red_ranked, sig)
+        else:
+            red2 = distinct_red(red, ex, red_ranked)
+        t = Ticket(name, red2, blue, note)
+        ex.append(t)
+        out.append(t)
+    return out
+
+
+def max_red_overlap_with_prior_reds(red: tuple[int, ...], prior_red_sets: Sequence[frozenset[int]]) -> int:
+    """Largest count of shared reds between `red` and any single prior draw."""
+    current = frozenset(red)
+    if not prior_red_sets:
+        return 0
+    return max(len(current & prior_set) for prior_set in prior_red_sets)
+
+
+def _single_swap_red_candidates(
+    red: tuple[int, ...],
+    ranked: list[int],
+    *,
+    preserve_zone_signature: tuple[int, int, int] | None,
+) -> Iterable[tuple[int, ...]]:
+    current = list(red)
+    for idx in range(6):
+        zone = red_zone_index(current[idx]) if preserve_zone_signature is not None else None
+        for number in ranked:
+            if number in current:
+                continue
+            if preserve_zone_signature is not None and red_zone_index(number) != zone:
+                continue
+            yield tuple(sorted(current[:idx] + [number] + current[idx + 1 :]))
+
+
+def adjust_red_exact_full_history_overlap(
+    red: tuple[int, ...],
+    prior_red_sets: Sequence[frozenset[int]],
+    ranked: list[int],
+    *,
+    target: int = EXACT_FULL_HISTORY_RED_OVERLAP,
+    existing_reds: set[tuple[int, ...]] | None = None,
+    preserve_zone_signature: tuple[int, int, int] | None = None,
+    max_passes: int = 96,
+) -> tuple[int, ...]:
+    """Greedy single-ball swaps until max prior overlap equals `target` (default 4)."""
+    existing_reds = existing_reds or set()
+    best = tuple(sorted(red))
+    if not prior_red_sets:
+        return best
+
+    def sort_key(candidate: tuple[int, ...]) -> tuple[int, int, int]:
+        overlap = max_red_overlap_with_prior_reds(candidate, prior_red_sets)
+        duplicate = int(candidate in existing_reds)
+        rank_penalty = sum(ranked.index(number) if number in ranked else 99 for number in candidate)
+        return (duplicate, abs(overlap - target), rank_penalty)
+
+    for _ in range(max_passes):
+        overlap = max_red_overlap_with_prior_reds(best, prior_red_sets)
+        if overlap == target and best not in existing_reds:
+            return best
+        improved: tuple[int, ...] | None = None
+        improved_key = sort_key(best)
+        for candidate in _single_swap_red_candidates(
+            best, ranked, preserve_zone_signature=preserve_zone_signature
+        ):
+            candidate_key = sort_key(candidate)
+            if candidate_key < improved_key:
+                improved_key = candidate_key
+                improved = candidate
+        if improved is None:
+            break
+        best = improved
+    return best
+
+
+def apply_exact_four_red_overlap_portfolio(
+    tickets: list[Ticket],
+    prior_draws: list[Draw],
+    red_ranked: list[int],
+    *,
+    zone1_follow: bool,
+) -> list[Ticket]:
+    """Enforce exact full-history max red overlap (default 4) on each ticket."""
+    prior_red_sets = [frozenset(draw.red) for draw in prior_draws]
+    existing: set[tuple[int, ...]] = set()
+    adjusted: list[Ticket] = []
+    suffix = "·全历史红重合4"
+    for ticket in tickets:
+        preserve_sig = red_zone_signature(ticket.red) if zone1_follow else None
+        red = adjust_red_exact_full_history_overlap(
+            ticket.red,
+            prior_red_sets,
+            red_ranked,
+            existing_reds=existing,
+            preserve_zone_signature=preserve_sig,
+        )
+        existing.add(red)
+        note = ticket.note if suffix in ticket.note else f"{ticket.note}{suffix}"
+        adjusted.append(Ticket(ticket.name, red, ticket.blue, note))
+    return adjusted
+
+
+def generate_tickets(
+    window: list[Draw],
+    state: StrategyState,
+    ticket_count: int,
+    *,
+    zone1_follow_red_counts: dict[int, int] | None = None,
+    supplement_zone1_break: int = 0,
+    prior_draws: list[Draw] | None = None,
+    enforce_exact_four_red_overlap: bool = True,
+) -> tuple[list[Ticket], list[int], list[int], dict[int, dict[str, float]], dict[int, dict[str, float]]]:
+    red_ranked, red_features_table, red_scores = score_red(window, state)
+    if (
+        ticket_count == 5
+        and is_zone1_break_last(window)
+        and zone1_follow_red_counts is not None
+    ):
+        red_ranked = refine_red_ranked_zone1_follow_ties(red_scores, zone1_follow_red_counts)
     blue_ranked, blue_features_table = score_blue(window, state)
     last = window[-1]
     prev = window[-2]
@@ -463,9 +864,30 @@ def generate_tickets(window: list[Draw], state: StrategyState, ticket_count: int
     # enforce "2 mainline + 2 mirror + 1 detached" to reduce red-line dilution.
     tickets: list[Ticket] = []
     if ticket_count == 5:
-        for t in build_red_priority_portfolio(red_ranked, blue_ranked, window):
-            red = distinct_red(t.red, tickets, red_ranked)
+        zone1_follow = is_zone1_break_last(window)
+        portfolio = (
+            build_portfolio_after_zone1_break(red_ranked, blue_ranked, window)
+            if zone1_follow
+            else build_red_priority_portfolio(red_ranked, blue_ranked, window)
+        )
+        for t in portfolio:
+            if zone1_follow:
+                sig = red_zone_signature(t.red)
+                red = distinct_red_preserve_zone_signature(t.red, tickets, red_ranked, sig)
+            else:
+                red = distinct_red(t.red, tickets, red_ranked)
             tickets.append(Ticket(t.name, red, t.blue, t.note))
+        tickets = apply_diverse_blues(tickets, window, blue_ranked)
+        if zone1_follow and supplement_zone1_break > 0:
+            tickets.extend(
+                build_zone1_break_supplement_tickets(
+                    red_ranked,
+                    blue_ranked,
+                    window,
+                    tickets,
+                    count=supplement_zone1_break,
+                )
+            )
     else:
         ordered_templates = sorted(TEMPLATE_NAMES, key=lambda name: (-state.template_scores[name], TEMPLATE_NAMES.index(name)))
         chosen = ordered_templates[:ticket_count]
@@ -473,6 +895,11 @@ def generate_tickets(window: list[Draw], state: StrategyState, ticket_count: int
             t = template_map[name]
             red = distinct_red(t.red, tickets, red_ranked)
             tickets.append(Ticket(t.name, red, t.blue, t.note))
+    if enforce_exact_four_red_overlap and prior_draws:
+        zone1_follow = is_zone1_break_last(window)
+        tickets = apply_exact_four_red_overlap_portfolio(
+            tickets, prior_draws, red_ranked, zone1_follow=zone1_follow
+        )
     return tickets, red_ranked, blue_ranked, red_features_table, blue_features_table
 
 
@@ -538,31 +965,42 @@ def rolling_backtest(
     red_weight_overrides: dict[str, float] | None = None,
     red_weight_extreme_overrides: dict[str, float] | None = None,
     preset: str = "full",
+    blue_weight_overrides: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     state = build_state(
         adaptive=adaptive,
         overrides=red_weight_overrides,
         extreme_overrides=red_weight_extreme_overrides,
         preset=preset,
+        blue_weight_overrides=blue_weight_overrides,
     )
     aggregate = defaultdict(int)
     aggregate_lists: dict[str, list[float]] = defaultdict(list)
     segment_aggregate: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     results: list[dict[str, object]] = []
 
+    zone1_follow_red = zone1_break_follow_red_counts(draws)
     for start in range(0, len(draws) - window_size):
         window = draws[start : start + window_size]
         actual = draws[start + window_size]
-        tickets, red_ranked, blue_ranked, red_table, blue_table = generate_tickets(window, state, ticket_count)
+        tickets, red_ranked, blue_ranked, red_table, blue_table = generate_tickets(
+            window,
+            state,
+            ticket_count,
+            zone1_follow_red_counts=zone1_follow_red,
+            prior_draws=draws[: start + window_size],
+        )
         aggregate["extreme_windows"] += int(is_extreme_window(window))
         hits = [hit_summary(ticket, actual) for ticket in tickets]
         best = max(hits, key=lambda h: (h["red_hits"], h["blue_hits"]))
         any_same_ticket_4p1 = any(h["red_hits"] >= 4 and h["blue_hits"] == 1 for h in hits)
+        any_blue_hit = int(any(h["blue_hits"] >= 1 for h in hits))
 
         aggregate["windows"] += 1
         aggregate["best_red_3plus"] += int(best["red_hits"] >= 3)
         aggregate["best_red_4plus"] += int(best["red_hits"] >= 4)
         aggregate["best_blue_1plus"] += int(best["blue_hits"] >= 1)
+        aggregate["any_blue_hit"] += any_blue_hit
         aggregate["same_ticket_red4_blue1"] += int(any_same_ticket_4p1)
         aggregate_lists["best_red_hits"].append(best["red_hits"])
         aggregate_lists["best_blue_hits"].append(best["blue_hits"])
@@ -571,6 +1009,7 @@ def rolling_backtest(
         segment_aggregate[segment]["best_red_3plus"] += int(best["red_hits"] >= 3)
         segment_aggregate[segment]["best_red_4plus"] += int(best["red_hits"] >= 4)
         segment_aggregate[segment]["best_blue_1plus"] += int(best["blue_hits"] >= 1)
+        segment_aggregate[segment]["any_blue_hit"] += any_blue_hit
 
         results.append(
             {
@@ -614,6 +1053,7 @@ def rolling_backtest(
         "best_red_3plus_rate": aggregate["best_red_3plus"] / aggregate["windows"],
         "best_red_4plus_rate": aggregate["best_red_4plus"] / aggregate["windows"],
         "best_blue_1plus_rate": aggregate["best_blue_1plus"] / aggregate["windows"],
+        "any_blue_hit_rate": aggregate["any_blue_hit"] / aggregate["windows"],
         "same_ticket_red4_blue1_rate": aggregate["same_ticket_red4_blue1"] / aggregate["windows"],
         "extreme_window_rate": aggregate["extreme_windows"] / aggregate["windows"],
         "avg_best_red_hits": statistics.mean(aggregate_lists["best_red_hits"]),
@@ -627,6 +1067,7 @@ def rolling_backtest(
                 "best_red_3plus_rate": values["best_red_3plus"] / values["windows"],
                 "best_red_4plus_rate": values["best_red_4plus"] / values["windows"],
                 "best_blue_1plus_rate": values["best_blue_1plus"] / values["windows"],
+                "any_blue_hit_rate": values["any_blue_hit"] / values["windows"],
             }
             for key, values in sorted(segment_aggregate.items())
         },
@@ -639,9 +1080,50 @@ def compare_summaries(fixed: dict[str, object], adaptive: dict[str, object]) -> 
         "best_red_3plus_delta": adaptive["best_red_3plus_rate"] - fixed["best_red_3plus_rate"],
         "best_red_4plus_delta": adaptive["best_red_4plus_rate"] - fixed["best_red_4plus_rate"],
         "best_blue_1plus_delta": adaptive["best_blue_1plus_rate"] - fixed["best_blue_1plus_rate"],
+        "any_blue_hit_delta": adaptive["any_blue_hit_rate"] - fixed["any_blue_hit_rate"],
         "same_ticket_red4_blue1_delta": adaptive["same_ticket_red4_blue1_rate"] - fixed["same_ticket_red4_blue1_rate"],
         "avg_best_red_hits_delta": adaptive["avg_best_red_hits"] - fixed["avg_best_red_hits"],
     }
+
+
+def run_near300_blue_grid_search(
+    draws: list[Draw],
+    window_size: int,
+    ticket_count: int,
+) -> tuple[dict[str, float], dict[str, object], list[dict[str, object]]]:
+    """Grid `blue_weights` on last-300 tail; KPI: any_blue_hit_rate then best_red_3plus_rate (fixed, preset recent300)."""
+    draws_tail = slice_recent_draws(draws, 300)
+    axes: tuple[tuple[str, tuple[float, ...]], ...] = (
+        ("neighbor_last", (0.0, 0.02, 0.04, 0.06)),
+        ("repeat_last", (0.0, 0.02, 0.04)),
+        ("omission_mid", (0.0, 0.04, 0.08)),
+        ("omission_deep", (0.0, 0.04)),
+    )
+    names = [a[0] for a in axes]
+    grids = [a[1] for a in axes]
+    ranked_rows: list[dict[str, object]] = []
+    for values in itertools.product(*grids):
+        weights = {name: 0.0 for name in BLUE_FEATURES}
+        for name, value in zip(names, values):
+            weights[name] = value
+        _, summary = rolling_backtest(
+            draws_tail,
+            window_size,
+            ticket_count,
+            adaptive=False,
+            preset="recent300",
+            blue_weight_overrides=weights,
+        )
+        ranked_rows.append({"blue_weights": dict(weights), "summary": summary})
+    ranked_rows.sort(
+        key=lambda r: (
+            -r["summary"]["any_blue_hit_rate"],
+            -r["summary"]["best_red_3plus_rate"],
+            -r["summary"]["best_red_4plus_rate"],
+        )
+    )
+    best = ranked_rows[0]
+    return best["blue_weights"], best["summary"], ranked_rows
 
 
 def red_priority_score(summary: dict[str, object]) -> float:
@@ -840,7 +1322,12 @@ def build_report(
     lines.append("| --- | --- | --- | --- |")
     lines.append(f"| 5注至少1注红球3中 | `{fixed_summary['best_red_3plus_rate']:.2%}` | `{adaptive_summary['best_red_3plus_rate']:.2%}` | `{comparison['best_red_3plus_delta']:+.2%}` |")
     lines.append(f"| 5注至少1注红球4中 | `{fixed_summary['best_red_4plus_rate']:.2%}` | `{adaptive_summary['best_red_4plus_rate']:.2%}` | `{comparison['best_red_4plus_delta']:+.2%}` |")
-    lines.append(f"| 5注至少1注蓝球命中 | `{fixed_summary['best_blue_1plus_rate']:.2%}` | `{adaptive_summary['best_blue_1plus_rate']:.2%}` | `{comparison['best_blue_1plus_delta']:+.2%}` |")
+    lines.append(
+        f"| 最优注蓝球命中(按红优先取最优注) | `{fixed_summary['best_blue_1plus_rate']:.2%}` | `{adaptive_summary['best_blue_1plus_rate']:.2%}` | `{comparison['best_blue_1plus_delta']:+.2%}` |"
+    )
+    lines.append(
+        f"| 5注任一蓝球命中 | `{fixed_summary['any_blue_hit_rate']:.2%}` | `{adaptive_summary['any_blue_hit_rate']:.2%}` | `{comparison['any_blue_hit_delta']:+.2%}` |"
+    )
     lines.append(f"| 同一注红4+蓝1 | `{fixed_summary['same_ticket_red4_blue1_rate']:.2%}` | `{adaptive_summary['same_ticket_red4_blue1_rate']:.2%}` | `{comparison['same_ticket_red4_blue1_delta']:+.2%}` |")
     lines.append(f"| 最优单注平均红球命中 | `{fixed_summary['avg_best_red_hits']:.2f}` | `{adaptive_summary['avg_best_red_hits']:.2f}` | `{comparison['avg_best_red_hits_delta']:+.2f}` |")
     lines.append("")
@@ -882,12 +1369,65 @@ def main() -> None:
         default="full",
         help="红球权重预设：full=全历史稳定性最优；recent300=最近300期稳定性微调最优",
     )
+    parser.add_argument(
+        "--grid-search-blue-near300",
+        action="store_true",
+        help="在最近300期截尾上网格搜索蓝球特征权重（preset=recent300），主 KPI：五注任一蓝中；辅 KPI：红3+",
+    )
     args = parser.parse_args()
 
     draws = parse_history(Path(args.history))
     draws = slice_recent_draws(draws, args.recent_draws)
     if len(draws) <= args.window_size:
         raise SystemExit("历史数据不足，无法完成滚动回测。")
+
+    if args.grid_search_blue_near300:
+        draws_full = parse_history(Path(args.history))
+        tail = slice_recent_draws(draws_full, 300)
+        if len(tail) <= args.window_size:
+            raise SystemExit("历史数据不足，无法完成近端蓝球网格搜索。")
+        _, baseline_s = rolling_backtest(
+            tail,
+            args.window_size,
+            args.ticket_count,
+            adaptive=False,
+            preset="recent300",
+            blue_weight_overrides={name: 0.0 for name in BLUE_FEATURES},
+        )
+        best_w, best_s, all_rows = run_near300_blue_grid_search(draws_full, args.window_size, args.ticket_count)
+        print("近端蓝球权重网格搜索完成（最近300期截尾 + preset=recent300 + 固定72组组合）。")
+        print(
+            f"基线(蓝特征权全0): 五注任一蓝中={baseline_s['any_blue_hit_rate']:.2%} "
+            f"红3+={baseline_s['best_red_3plus_rate']:.2%}"
+        )
+        print(
+            f"最优: 五注任一蓝中={best_s['any_blue_hit_rate']:.2%} "
+            f"红3+={best_s['best_red_3plus_rate']:.2%} "
+            f"最优注蓝(红优)={best_s['best_blue_1plus_rate']:.2%}"
+        )
+        print("推荐 blue_weights（非零项）:", {k: v for k, v in best_w.items() if v != 0.0})
+        print("Top 8:")
+        for idx, row in enumerate(all_rows[:8], start=1):
+            s = row["summary"]
+            w = row["blue_weights"]
+            compact = {k: v for k, v in w.items() if v != 0.0}
+            print(
+                f"  {idx}. any_blue={s['any_blue_hit_rate']:.2%} red3+={s['best_red_3plus_rate']:.2%} "
+                f"red4+={s['best_red_4plus_rate']:.2%} w={compact}"
+            )
+        _, full_s = rolling_backtest(
+            draws_full,
+            args.window_size,
+            args.ticket_count,
+            adaptive=False,
+            preset="recent300",
+            blue_weight_overrides=best_w,
+        )
+        print(
+            f"全历史校验(套用最优蓝权): 五注任一蓝中={full_s['any_blue_hit_rate']:.2%} "
+            f"红3+={full_s['best_red_3plus_rate']:.2%}"
+        )
+        return
 
     if args.grid_search:
         best_overrides, best_summary, ranked = run_grid_search(draws, args.window_size, args.ticket_count)
@@ -981,8 +1521,10 @@ def main() -> None:
     print(f"滚动窗口数：{adaptive_summary['windows']}")
     print(f"固定规则 红3+命中率：{fixed_summary['best_red_3plus_rate']:.2%}")
     print(f"自适应规则 红3+命中率：{adaptive_summary['best_red_3plus_rate']:.2%}")
-    print(f"固定规则 蓝1命中率：{fixed_summary['best_blue_1plus_rate']:.2%}")
-    print(f"自适应规则 蓝1命中率：{adaptive_summary['best_blue_1plus_rate']:.2%}")
+    print(f"固定规则 最优注蓝中(红优)：{fixed_summary['best_blue_1plus_rate']:.2%}")
+    print(f"自适应规则 最优注蓝中(红优)：{adaptive_summary['best_blue_1plus_rate']:.2%}")
+    print(f"固定规则 五注任一蓝中：{fixed_summary['any_blue_hit_rate']:.2%}")
+    print(f"自适应规则 五注任一蓝中：{adaptive_summary['any_blue_hit_rate']:.2%}")
 
 
 if __name__ == "__main__":

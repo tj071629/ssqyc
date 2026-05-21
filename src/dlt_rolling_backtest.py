@@ -210,6 +210,395 @@ def zone_signature(front: Iterable[int]) -> tuple[int, int, int]:
     return tuple(counts)
 
 
+# When front has no zone-2 numbers (13-24), enforce odd-even + sum band (historical break-mid sample:
+# ~P25–P75 sum on full history ≈ 73–109; strict defaults follow that; relax widens for hard repair cases.)
+BREAK_ZONE2_SUM_MIN = 73
+BREAK_ZONE2_SUM_MAX = 109
+BREAK_ZONE2_SUM_RELAX_MIN = 60
+BREAK_ZONE2_SUM_RELAX_MAX = 125
+
+
+def configure_break_zone_two(
+    *,
+    sum_min: int | None = None,
+    sum_max: int | None = None,
+    sum_relax_min: int | None = None,
+    sum_relax_max: int | None = None,
+) -> None:
+    """Override break-mid sum bands (e.g. from CLI). Relax band must cover strict band."""
+    global BREAK_ZONE2_SUM_MIN, BREAK_ZONE2_SUM_MAX, BREAK_ZONE2_SUM_RELAX_MIN, BREAK_ZONE2_SUM_RELAX_MAX
+    smin = BREAK_ZONE2_SUM_MIN if sum_min is None else sum_min
+    smax = BREAK_ZONE2_SUM_MAX if sum_max is None else sum_max
+    rmin = BREAK_ZONE2_SUM_RELAX_MIN if sum_relax_min is None else sum_relax_min
+    rmax = BREAK_ZONE2_SUM_RELAX_MAX if sum_relax_max is None else sum_relax_max
+    if smin >= smax:
+        raise ValueError("break_zone2: sum_min must be < sum_max")
+    if rmin >= rmax:
+        raise ValueError("break_zone2: relax_min must be < relax_max")
+    if rmin > smin or rmax < smax:
+        raise ValueError("break_zone2: relax band must cover strict band [sum_min, sum_max]")
+    BREAK_ZONE2_SUM_MIN = smin
+    BREAK_ZONE2_SUM_MAX = smax
+    BREAK_ZONE2_SUM_RELAX_MIN = rmin
+    BREAK_ZONE2_SUM_RELAX_MAX = rmax
+
+
+def front_is_break_zone2(front: Iterable[int]) -> bool:
+    """True iff no numbers in mid zone 13-24."""
+    return zone_signature(front)[1] == 0
+
+
+def front_odd_even_ok(front: Iterable[int]) -> bool:
+    """DLT common 2:3 or 3:2 (odd : even among five)."""
+    odd = sum(1 for number in front if number % 2 == 1)
+    return odd in (2, 3)
+
+
+def front_sum_in_band(front: Iterable[int], *, lo: int, hi: int) -> bool:
+    total = sum(front)
+    return lo <= total <= hi
+
+
+def _break_zone2_score_band(front: tuple[int, ...], lo: int, hi: int) -> tuple[int, int]:
+    """Lower is better: (sum_penalty vs [lo,hi], odd_penalty)."""
+    total = sum(front)
+    odd = sum(1 for n in front if n % 2 == 1)
+    odd_pen = 0 if odd in (2, 3) else min(abs(odd - 2), abs(odd - 3))
+    if lo <= total <= hi:
+        sum_pen = 0
+    elif total < lo:
+        sum_pen = lo - total
+    else:
+        sum_pen = total - hi
+    return (sum_pen, odd_pen)
+
+
+def repair_break_zone2_front(
+    front: tuple[int, ...],
+    ranked: list[int],
+    window: list[Draw],
+    *,
+    forbidden_fronts: set[tuple[int, ...]],
+) -> tuple[int, ...]:
+    """Swap in ranked z1/z3-only pool until odd-even + sum band pass, or return best-effort."""
+    if not front_is_break_zone2(front):
+        return front
+    pool = [number for number in ranked if zone_index(number) != 1]
+    pool_set = set(pool)
+    best = sorted(front)
+    if not all(number in pool_set for number in best):
+        return tuple(best)
+
+    if front_odd_even_ok(tuple(best)) and front_sum_in_band(
+        tuple(best), lo=BREAK_ZONE2_SUM_MIN, hi=BREAK_ZONE2_SUM_MAX
+    ):
+        return tuple(best)
+
+    for band_lo, band_hi in (
+        (BREAK_ZONE2_SUM_MIN, BREAK_ZONE2_SUM_MAX),
+        (BREAK_ZONE2_SUM_RELAX_MIN, BREAK_ZONE2_SUM_RELAX_MAX),
+    ):
+        for _ in range(200):
+            current = tuple(best)
+            if front_odd_even_ok(current) and front_sum_in_band(current, lo=band_lo, hi=band_hi):
+                return current
+            best_list = list(current)
+            improved = False
+            for pos in range(4, -1, -1):
+                for new in pool:
+                    if new == best_list[pos] or new in best_list:
+                        continue
+                    trial_list = best_list[:]
+                    trial_list[pos] = new
+                    trial_list.sort()
+                    trial = tuple(trial_list)
+                    if zone_signature(trial)[1] != 0:
+                        continue
+                    if exact_front_seen(window, trial):
+                        continue
+                    if trial in forbidden_fronts:
+                        continue
+                    if not all(number in pool_set for number in trial):
+                        continue
+                    if _break_zone2_score_band(trial, band_lo, band_hi) < _break_zone2_score_band(
+                        current, band_lo, band_hi
+                    ):
+                        best = trial_list
+                        improved = True
+                        break
+                if improved:
+                    break
+            if not improved:
+                break
+    return tuple(sorted(best))
+
+
+def zone_index_5(number: int) -> int:
+    if number <= 7:
+        return 0
+    if number <= 14:
+        return 1
+    if number <= 21:
+        return 2
+    if number <= 28:
+        return 3
+    return 4
+
+
+def zone5_to_zone3(zone5: int) -> int:
+    if zone5 <= 1:
+        return 0
+    if zone5 <= 3:
+        return 1
+    return 2
+
+
+def zone_signature_n(front: Iterable[int], zone_fn) -> tuple[int, ...]:
+    counts = [0] * 5
+    for number in front:
+        counts[zone_fn(number)] += 1
+    return tuple(counts)
+
+
+def predict_hot_break_zone(window: list[Draw], zone_fn, n_zones: int) -> int:
+    recent = window[-6:]
+    zero_counts = [0] * n_zones
+    for draw in recent:
+        signature = zone_signature_n(draw.front, zone_fn)
+        for idx in range(n_zones):
+            if signature[idx] == 0:
+                zero_counts[idx] += 1
+    return max(range(n_zones), key=lambda idx: (zero_counts[idx], -idx))
+
+
+def _front_violates_zone_rules(
+    front: tuple[int, ...],
+    *,
+    forbidden_zones: set[int],
+    zone_fn,
+    max_per_zone: dict[int, int] | None,
+    cap_zone_fn=None,
+) -> bool:
+    cap_zone_fn = cap_zone_fn or zone_fn
+    for number in front:
+        if zone_fn(number) in forbidden_zones:
+            return True
+    if max_per_zone:
+        for zone, limit in max_per_zone.items():
+            if sum(1 for number in front if cap_zone_fn(number) == zone) > limit:
+                return True
+    return False
+
+
+def repair_front_zone_rules(
+    front: tuple[int, ...],
+    ranked: list[int],
+    window: list[Draw],
+    *,
+    forbidden_zones: set[int],
+    zone_fn,
+    max_per_zone: dict[int, int] | None = None,
+    cap_zone_fn=None,
+    forbidden_fronts: set[tuple[int, ...]] | None = None,
+    break_zone2_band: bool = False,
+) -> tuple[int, ...]:
+    forbidden_fronts = forbidden_fronts or set()
+    cap_zone_fn = cap_zone_fn or zone_fn
+    pool: list[int] = []
+    for number in ranked:
+        if zone_fn(number) in forbidden_zones:
+            continue
+        if break_zone2_band and zone_index(number) == 1:
+            continue
+        pool.append(number)
+    pool_set = set(pool)
+    best = tuple(sorted(front))
+    if not all(number in pool_set for number in best):
+        best = tuple(sorted(number for number in ranked if number in pool_set)[:5])
+    if not _front_violates_zone_rules(
+        best,
+        forbidden_zones=forbidden_zones,
+        zone_fn=zone_fn,
+        max_per_zone=max_per_zone,
+        cap_zone_fn=cap_zone_fn,
+    ):
+        if not break_zone2_band or (
+            front_is_break_zone2(best)
+            and front_odd_even_ok(best)
+            and front_sum_in_band(best, lo=BREAK_ZONE2_SUM_MIN, hi=BREAK_ZONE2_SUM_MAX)
+        ):
+            return best
+
+    for band_lo, band_hi in (
+        (BREAK_ZONE2_SUM_MIN, BREAK_ZONE2_SUM_MAX),
+        (BREAK_ZONE2_SUM_RELAX_MIN, BREAK_ZONE2_SUM_RELAX_MAX),
+    ):
+        current = tuple(sorted(best))
+        for _ in range(200):
+            if not _front_violates_zone_rules(
+                current,
+                forbidden_zones=forbidden_zones,
+                zone_fn=zone_fn,
+                max_per_zone=max_per_zone,
+                cap_zone_fn=cap_zone_fn,
+            ):
+                if break_zone2_band:
+                    if not front_is_break_zone2(current):
+                        pass
+                    elif front_odd_even_ok(current) and front_sum_in_band(current, lo=band_lo, hi=band_hi):
+                        return current
+                else:
+                    return current
+            best_list = list(current)
+            improved = False
+            for pos in range(4, -1, -1):
+                for new in pool:
+                    if new in best_list:
+                        continue
+                    trial_list = best_list[:]
+                    trial_list[pos] = new
+                    trial = tuple(sorted(trial_list))
+                    if exact_front_seen(window, trial) or trial in forbidden_fronts:
+                        continue
+                    if _front_violates_zone_rules(
+                        trial,
+                        forbidden_zones=forbidden_zones,
+                        zone_fn=zone_fn,
+                        max_per_zone=max_per_zone,
+                        cap_zone_fn=cap_zone_fn,
+                    ):
+                        continue
+                    if break_zone2_band and zone_signature(trial)[1] != 0:
+                        continue
+                    current = trial
+                    improved = True
+                    break
+                if improved:
+                    break
+            if not improved:
+                break
+        if not break_zone2_band:
+            break
+    return tuple(sorted(current))
+
+
+ZONE_POLICY_EXEMPT = frozenset({"断区反抽票", "中区加压票"})
+
+
+def apply_zone_policy(
+    tickets: list[Ticket],
+    ranked: list[int],
+    window: list[Draw],
+    policy: str,
+) -> list[Ticket]:
+    """zone_policy: baseline | none | zone3 | zone5 | zone35 | zone35_break2."""
+    if policy == "none":
+        return tickets
+    if policy == "baseline":
+        return apply_break_zone_two_constraints(tickets, ranked, window)
+
+    # 3+5 实战默认：3区分区固定断第2区(13-24)，5区仅在头/尾细带做弱带≤1码
+    if policy == "zone35_break2":
+        predict_z3 = 1
+    else:
+        predict_z3 = predict_hot_break_zone(window, zone_index, 3)
+    predict_z5 = predict_hot_break_zone(window, zone_index_5, 5)
+    weak_z5 = predict_z5
+    if policy in {"zone35", "zone35_break2"} and zone5_to_zone3(weak_z5) == predict_z3:
+        zero_counts = [0] * 5
+        for draw in window[-6:]:
+            signature = zone_signature_n(draw.front, zone_index_5)
+            for idx in range(5):
+                if signature[idx] == 0:
+                    zero_counts[idx] += 1
+        candidates = [idx for idx in range(5) if zone5_to_zone3(idx) != predict_z3]
+        if candidates:
+            weak_z5 = max(candidates, key=lambda idx: (zero_counts[idx], -idx))
+
+    updated: list[Ticket] = []
+    for ticket in tickets:
+        if ticket.name in ZONE_POLICY_EXEMPT:
+            updated.append(distinct_ticket(ticket, updated, window, ranked))
+            continue
+
+        forbidden_zones: set[int] = set()
+        max_per_zone: dict[int, int] | None = None
+        cap_zone_fn = zone_index
+        zone_fn = zone_index
+        break_zone2_band = False
+        note_suffix = ""
+
+        if policy == "zone3":
+            forbidden_zones = {predict_z3}
+            note_suffix = f"；3区押断区{predict_z3 + 1}"
+            if predict_z3 == 1:
+                break_zone2_band = True
+        elif policy == "zone5":
+            forbidden_zones = {predict_z5}
+            zone_fn = zone_index_5
+            cap_zone_fn = zone_index_5
+            note_suffix = f"；5区押断区{predict_z5 + 1}"
+        elif policy in {"zone35", "zone35_break2"}:
+            forbidden_zones = {predict_z3}
+            if predict_z3 == 1:
+                break_zone2_band = True
+            if zone5_to_zone3(weak_z5) != predict_z3:
+                max_per_zone = {weak_z5: 1}
+                cap_zone_fn = zone_index_5
+            tag = "断二区+5区" if policy == "zone35_break2" else "3+5"
+            note_suffix = f"；{tag}:3区断{predict_z3 + 1}"
+            if max_per_zone:
+                note_suffix += f"+5区弱带{weak_z5 + 1}≤1码"
+        else:
+            updated.append(distinct_ticket(ticket, updated, window, ranked))
+            continue
+
+        forbidden_fronts = {item.front for item in updated}
+        repaired = repair_front_zone_rules(
+            ticket.front,
+            ranked,
+            window,
+            forbidden_zones=forbidden_zones,
+            zone_fn=zone_fn,
+            max_per_zone=max_per_zone,
+            cap_zone_fn=cap_zone_fn,
+            forbidden_fronts=forbidden_fronts,
+            break_zone2_band=break_zone2_band,
+        )
+        note = ticket.note + note_suffix if repaired != ticket.front else ticket.note
+        updated.append(distinct_ticket(Ticket(ticket.name, repaired, ticket.back, note), updated, window, ranked))
+
+    if policy in {"zone3", "zone35", "zone35_break2"} and predict_z3 == 1:
+        return apply_break_zone_two_constraints(updated, ranked, window)
+    return updated
+
+
+def apply_break_zone_two_constraints(
+    tickets: list[Ticket],
+    ranked: list[int],
+    window: list[Draw],
+) -> list[Ticket]:
+    """Enforce odd-even + sum band on any ticket whose front already has zero mid-zone numbers."""
+    updated: list[Ticket] = []
+    for ticket in tickets:
+        front = ticket.front
+        forbidden = {t.front for t in updated}
+        if not front_is_break_zone2(front):
+            updated.append(distinct_ticket(ticket, updated, window, ranked))
+            continue
+        strict_ok = front_odd_even_ok(front) and front_sum_in_band(
+            front, lo=BREAK_ZONE2_SUM_MIN, hi=BREAK_ZONE2_SUM_MAX
+        )
+        if strict_ok:
+            updated.append(distinct_ticket(ticket, updated, window, ranked))
+            continue
+        repaired = repair_break_zone2_front(front, ranked, window, forbidden_fronts=forbidden)
+        note = ticket.note + "；断二区奇偶/和值校正" if repaired != front else ticket.note
+        cand = Ticket(ticket.name, repaired, ticket.back, note)
+        updated.append(distinct_ticket(cand, updated, window, ranked))
+    return updated
+
+
 def format_numbers(numbers: Iterable[int]) -> str:
     return " ".join(f"{number:02d}" for number in numbers)
 
@@ -453,6 +842,10 @@ def classify_window_state(window: list[Draw]) -> dict[str, object]:
     else:
         back_state = "mixed"
 
+    back_recent = window[-4:]
+    back_segments = {back_segment(number) for draw in back_recent for number in draw.back}
+    back_segment_jump = len(back_segments) >= 2
+
     return {
         "front_state": front_state,
         "back_state": back_state,
@@ -461,6 +854,7 @@ def classify_window_state(window: list[Draw]) -> dict[str, object]:
         "dominant_zero_zone": dominant_zero_zone,
         "dominant_zone": dominant_zone,
         "extreme_recent": extreme_recent,
+        "back_segment_jump": back_segment_jump,
     }
 
 
@@ -545,6 +939,22 @@ def back_pair_overlap(left: tuple[int, ...], right: tuple[int, ...]) -> int:
     return len(set(left) & set(right))
 
 
+def back_segment(number: int) -> int:
+    """0=low(01-03), 1=mid(04-09), 2=high(10-12)."""
+    if number <= 3:
+        return 0
+    if number <= 9:
+        return 1
+    return 2
+
+
+def mid_back_candidates(back_ranked: list[int], *, limit: int = 4) -> list[int]:
+    ordered = [number for number in back_ranked if 4 <= number <= 9]
+    if len(ordered) < 2:
+        ordered = [number for number in BACK_RANGE if 4 <= number <= 9]
+    return ordered[:limit]
+
+
 def score_back_pair(
     pair: tuple[int, ...],
     back_ranked: list[int],
@@ -585,6 +995,8 @@ def score_back_pair(
 
     if abs(pair[0] - pair[1]) == 1:
         score += 0.3
+    if state_info.get("back_segment_jump"):
+        score += sum(1 for number in pair if 4 <= number <= 9) * 1.4
     return score
 
 
@@ -634,16 +1046,46 @@ def build_back_pair_pool(
     hot_back: list[int],
     warm_back: list[int],
     back_neighbors: list[int],
+    *,
+    pair_count: int = 5,
 ) -> list[tuple[int, ...]]:
     back_state = state_info["back_state"]
+    mid_band = mid_back_candidates(back_ranked)
     if back_state == "active":
-        pool = list(dict.fromkeys(list(last_back) + back_neighbors + hot_back[:5] + warm_back[:3] + back_ranked[:6]))
+        pool = list(
+            dict.fromkeys(
+                list(last_back)
+                + back_neighbors
+                + mid_band
+                + hot_back[:5]
+                + warm_back[:3]
+                + back_ranked[:6]
+            )
+        )
     elif back_state == "replenish":
-        pool = list(dict.fromkeys(warm_back[:6] + back_neighbors + hot_back[:4] + list(last_back) + back_ranked[:6]))
+        pool = list(
+            dict.fromkeys(
+                warm_back[:6]
+                + back_neighbors
+                + mid_band
+                + hot_back[:4]
+                + list(last_back)
+                + back_ranked[:6]
+            )
+        )
     else:
-        pool = list(dict.fromkeys(hot_back[:5] + back_neighbors + warm_back[:4] + list(last_back) + back_ranked[:6]))
+        pool = list(
+            dict.fromkeys(
+                hot_back[:5]
+                + back_neighbors
+                + mid_band
+                + warm_back[:4]
+                + list(last_back)
+                + back_ranked[:6]
+            )
+        )
 
-    pool = pool[:10]
+    pool = pool[:12]
     candidate_pairs = [tuple(sorted(pair)) for pair in itertools.combinations(pool, 2)]
     candidate_pairs.extend(
         [
@@ -653,10 +1095,14 @@ def build_back_pair_pool(
             choose_back_numbers(back_ranked, include=warm_back[:1] + back_neighbors[:1]),
             choose_back_numbers(back_ranked, include=back_neighbors[:2]),
             choose_back_numbers(back_ranked, include=list(last_back[:1]) + warm_back[:1]),
+            choose_back_numbers(back_ranked, include=mid_band[:2]),
+            choose_back_numbers(back_ranked, include=list(last_back[:1]) + mid_band[:1]),
+            choose_back_numbers(back_ranked, include=mid_band[:1] + back_neighbors[:1]),
         ]
     )
     candidate_pairs = unique_pairs(candidate_pairs)
-    return select_back_pairs(candidate_pairs, back_ranked, state_info, last_back, hot_back, warm_back, back_neighbors, count=5)
+    want = max(5, min(pair_count, 12))
+    return select_back_pairs(candidate_pairs, back_ranked, state_info, last_back, hot_back, warm_back, back_neighbors, count=want)
 
 
 def build_back_pair_routes(
@@ -666,25 +1112,70 @@ def build_back_pair_routes(
     hot_back: list[int],
     warm_back: list[int],
     back_neighbors: list[int],
+    *,
+    route_count: int = 8,
 ) -> list[tuple[int, ...]]:
-    """Return diversified 5-pair routes for 5 tickets.
-
-    Route design: active continuation / neighbor carry / warm-replenish / reverse jump / balanced fallback.
-    """
+    """Diversified back pairs: repeat / neighbor / mid-band / warm / reverse / pool fill."""
+    mid_band = mid_back_candidates(back_ranked)
     routes: list[tuple[int, ...]] = []
+    routes.append(choose_back_numbers(back_ranked, include=list(last_back)))
     routes.append(choose_back_numbers(back_ranked, include=list(last_back[:1]) + back_neighbors[:1]))
     routes.append(choose_back_numbers(back_ranked, include=back_neighbors[:2]))
+    routes.append(choose_back_numbers(back_ranked, include=mid_band[:2]))
+    routes.append(choose_back_numbers(back_ranked, include=list(last_back[:1]) + mid_band[:1]))
     routes.append(choose_back_numbers(back_ranked, include=warm_back[:1] + hot_back[:1]))
     routes.append(choose_back_numbers(back_ranked, include=warm_back[:1], reverse_jump=True, reverse_start_rank=4))
     routes.append(choose_back_numbers(back_ranked, include=hot_back[:1] + list(last_back[:1])))
 
-    pool = build_back_pair_pool(back_ranked, state_info, last_back, hot_back, warm_back, back_neighbors)
+    pool = build_back_pair_pool(
+        back_ranked,
+        state_info,
+        last_back,
+        hot_back,
+        warm_back,
+        back_neighbors,
+        pair_count=route_count,
+    )
     for pair in pool:
-        if len(routes) >= 5:
+        if len(routes) >= route_count:
             break
         routes.append(pair)
 
-    return unique_pairs(routes)[:5]
+    return unique_pairs(routes)[:route_count]
+
+
+def assign_back_pairs_for_tickets(
+    count: int,
+    routes: list[tuple[int, ...]],
+    pool: list[tuple[int, ...]],
+) -> list[tuple[int, ...]]:
+    """Spread back pairs across tickets; prefer routes first, then de-overlap pool picks."""
+    assigned: list[tuple[int, ...]] = []
+    seen: set[tuple[int, ...]] = set()
+    for pair in routes:
+        if len(assigned) >= count:
+            break
+        if pair in seen:
+            continue
+        assigned.append(pair)
+        seen.add(pair)
+
+    pool_index = 0
+    guard = 0
+    while len(assigned) < count and pool and guard < count * len(pool) * 2:
+        guard += 1
+        pair = pool[pool_index % len(pool)]
+        pool_index += 1
+        if pair in seen:
+            continue
+        overlap_penalty = max(back_pair_overlap(pair, existing) for existing in assigned) if assigned else 0
+        if overlap_penalty >= 2 and len(pool) > 1:
+            continue
+        assigned.append(pair)
+        seen.add(pair)
+    while len(assigned) < count and routes:
+        assigned.append(routes[len(assigned) % len(routes)])
+    return assigned[:count]
 
 
 def front_overlap(left: tuple[int, ...], right: tuple[int, ...]) -> int:
@@ -1031,7 +1522,13 @@ def choose_template_names_for_ten(state_info: dict[str, object], state: Strategy
     return ordered[:10]
 
 
-def generate_tickets(window: list[Draw], state: StrategyState, count: int = DEFAULT_TICKET_COUNT) -> tuple[list[Ticket], list[int], list[int], dict[int, dict[str, float]], dict[int, dict[str, float]]]:
+def generate_tickets(
+    window: list[Draw],
+    state: StrategyState,
+    count: int = DEFAULT_TICKET_COUNT,
+    *,
+    zone_policy: str = "baseline",
+) -> tuple[list[Ticket], list[int], list[int], dict[int, dict[str, float]], dict[int, dict[str, float]], dict[str, object]]:
     front_scores, front_feature_table = score_front_numbers(window, state)
     back_scores, back_feature_table = score_back_numbers(window, state)
     front_ranked = sort_candidates(front_scores)
@@ -1142,25 +1639,35 @@ def generate_tickets(window: list[Draw], state: StrategyState, count: int = DEFA
         else:
             selected_names = ["主承接票", "结构平衡票", "骨架回补票", "后区活跃票", "逆向跳号票"]
 
-    back_pair_pool = build_back_pair_pool(back_ranked, state_info, last.back, hot_back, warm_back, back_neighbors)
-    back_pair_routes = build_back_pair_routes(back_ranked, state_info, last.back, hot_back, warm_back, back_neighbors)
-    pair_index = 0
+    route_count = max(count, 8)
+    back_pair_pool = build_back_pair_pool(
+        back_ranked,
+        state_info,
+        last.back,
+        hot_back,
+        warm_back,
+        back_neighbors,
+        pair_count=route_count,
+    )
+    back_pair_routes = build_back_pair_routes(
+        back_ranked,
+        state_info,
+        last.back,
+        hot_back,
+        warm_back,
+        back_neighbors,
+        route_count=route_count,
+    )
+    back_pairs_for_tickets = assign_back_pairs_for_tickets(count, back_pair_routes, back_pair_pool)
     tickets: list[Ticket] = []
-    for name in selected_names[:count]:
+    for index, name in enumerate(selected_names[:count]):
         template = template_map[name]
-        if count == 5 and len(back_pair_routes) >= 5:
-            back_pair = back_pair_routes[len(tickets)]
-        elif name == "后区活跃票" and state_info["back_state"] == "active":
-            back_pair = back_pair_pool[0]
-        elif name == "后区回补票" and state_info["back_state"] == "replenish":
-            back_pair = back_pair_pool[0]
-        else:
-            back_pair = back_pair_pool[pair_index % len(back_pair_pool)]
-            pair_index += 1
+        back_pair = back_pairs_for_tickets[index]
         template = Ticket(template.name, template.front, back_pair, template.note)
         ticket = distinct_ticket(template, tickets, window, front_ranked)
         tickets.append(ticket)
     tickets = reshape_ticket_fronts(tickets, selected_names, front_ranked, front_feature_table, window, state_info)
+    tickets = apply_zone_policy(tickets, front_ranked, window, zone_policy)
     return tickets, front_ranked, back_ranked, front_feature_table, back_feature_table, state_info
 
 
@@ -1571,9 +2078,38 @@ def main() -> None:
     parser.add_argument("--early-stop-eval-window", type=int, default=200, help="每次评估使用最近多少窗口")
     parser.add_argument("--early-stop-patience", type=int, default=3, help="连续多少次无提升后触发早停")
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0005, help="视为提升的最小阈值")
+    parser.add_argument(
+        "--break-zone2-sum-min",
+        type=int,
+        default=73,
+        help="断二区前区和值下限（严格带，与历史断中区 P25 量级对齐）",
+    )
+    parser.add_argument(
+        "--break-zone2-sum-max",
+        type=int,
+        default=109,
+        help="断二区前区和值上限（严格带，与历史断中区 P75 量级对齐）",
+    )
+    parser.add_argument(
+        "--break-zone2-relax-min",
+        type=int,
+        default=60,
+        help="断二区前区和值放宽下限（校正仍失败时扩大搜索）",
+    )
+    parser.add_argument(
+        "--break-zone2-relax-max",
+        type=int,
+        default=125,
+        help="断二区前区和值放宽上限",
+    )
     args = parser.parse_args()
 
-    draws = parse_history(Path(args.history))
+    configure_break_zone_two(
+        sum_min=args.break_zone2_sum_min,
+        sum_max=args.break_zone2_sum_max,
+        sum_relax_min=args.break_zone2_relax_min,
+        sum_relax_max=args.break_zone2_relax_max,
+    )
     if len(draws) <= args.window_size:
         raise SystemExit("历史数据不足，无法完成滚动回测。")
 
